@@ -1,177 +1,211 @@
-"""Rich text and beautiful formatting in the terminal."""
+"""
+Python HTTP library with thread-safe connection pooling, file post support, user friendly, and more
+"""
 
-import os
-from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
+from __future__ import annotations
 
-from ._extension import load_ipython_extension  # noqa: F401
+# Set default logging handler to avoid "No handler found" warnings.
+import logging
+import sys
+import typing
+import warnings
+from logging import NullHandler
 
-__all__ = ["get_console", "reconfigure", "print", "inspect", "print_json"]
+from . import exceptions
+from ._base_connection import _TYPE_BODY
+from ._collections import HTTPHeaderDict
+from ._version import __version__
+from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
+from .filepost import _TYPE_FIELDS, encode_multipart_formdata
+from .poolmanager import PoolManager, ProxyManager, proxy_from_url
+from .response import BaseHTTPResponse, HTTPResponse
+from .util.request import make_headers
+from .util.retry import Retry
+from .util.timeout import Timeout
 
-if TYPE_CHECKING:
-    from .console import Console
-
-# Global console used by alternative print
-_console: Optional["Console"] = None
-
+# Ensure that Python is compiled with OpenSSL 1.1.1+
+# If the 'ssl' module isn't available at all that's
+# fine, we only care if the module is available.
 try:
-    _IMPORT_CWD = os.path.abspath(os.getcwd())
-except FileNotFoundError:
-    # Can happen if the cwd has been deleted
-    _IMPORT_CWD = ""
+    import ssl
+except ImportError:
+    pass
+else:
+    if not ssl.OPENSSL_VERSION.startswith("OpenSSL "):  # Defensive:
+        warnings.warn(
+            "urllib3 v2 only supports OpenSSL 1.1.1+, currently "
+            f"the 'ssl' module is compiled with {ssl.OPENSSL_VERSION!r}. "
+            "See: https://github.com/urllib3/urllib3/issues/3020",
+            exceptions.NotOpenSSLWarning,
+        )
+    elif ssl.OPENSSL_VERSION_INFO < (1, 1, 1):  # Defensive:
+        raise ImportError(
+            "urllib3 v2 only supports OpenSSL 1.1.1+, currently "
+            f"the 'ssl' module is compiled with {ssl.OPENSSL_VERSION!r}. "
+            "See: https://github.com/urllib3/urllib3/issues/2168"
+        )
+
+__author__ = "Andrey Petrov (andrey.petrov@shazow.net)"
+__license__ = "MIT"
+__version__ = __version__
+
+__all__ = (
+    "HTTPConnectionPool",
+    "HTTPHeaderDict",
+    "HTTPSConnectionPool",
+    "PoolManager",
+    "ProxyManager",
+    "HTTPResponse",
+    "Retry",
+    "Timeout",
+    "add_stderr_logger",
+    "connection_from_url",
+    "disable_warnings",
+    "encode_multipart_formdata",
+    "make_headers",
+    "proxy_from_url",
+    "request",
+    "BaseHTTPResponse",
+)
+
+logging.getLogger(__name__).addHandler(NullHandler())
 
 
-def get_console() -> "Console":
-    """Get a global :class:`~rich.console.Console` instance. This function is used when Rich requires a Console,
-    and hasn't been explicitly given one.
-
-    Returns:
-        Console: A console instance.
+def add_stderr_logger(
+    level: int = logging.DEBUG,
+) -> logging.StreamHandler[typing.TextIO]:
     """
-    global _console
-    if _console is None:
-        from .console import Console
+    Helper for quickly adding a StreamHandler to the logger. Useful for
+    debugging.
 
-        _console = Console()
-
-    return _console
-
-
-def reconfigure(*args: Any, **kwargs: Any) -> None:
-    """Reconfigures the global console by replacing it with another.
-
-    Args:
-        *args (Any): Positional arguments for the replacement :class:`~rich.console.Console`.
-        **kwargs (Any): Keyword arguments for the replacement :class:`~rich.console.Console`.
+    Returns the handler after adding it.
     """
-    from pip._vendor.rich.console import Console
+    # This method needs to be in this __init__.py to get the __name__ correct
+    # even if urllib3 is vendored within another package.
+    logger = logging.getLogger(__name__)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.debug("Added a stderr logging handler to logger: %s", __name__)
+    return handler
 
-    new_console = Console(*args, **kwargs)
-    _console = get_console()
-    _console.__dict__ = new_console.__dict__
+
+# ... Clean up.
+del NullHandler
 
 
-def print(
-    *objects: Any,
-    sep: str = " ",
-    end: str = "\n",
-    file: Optional[IO[str]] = None,
-    flush: bool = False,
-) -> None:
-    r"""Print object(s) supplied via positional arguments.
-    This function has an identical signature to the built-in print.
-    For more advanced features, see the :class:`~rich.console.Console` class.
+# All warning filters *must* be appended unless you're really certain that they
+# shouldn't be: otherwise, it's very hard for users to use most Python
+# mechanisms to silence them.
+# SecurityWarning's always go off by default.
+warnings.simplefilter("always", exceptions.SecurityWarning, append=True)
+# InsecurePlatformWarning's don't vary between requests, so we keep it default.
+warnings.simplefilter("default", exceptions.InsecurePlatformWarning, append=True)
 
-    Args:
-        sep (str, optional): Separator between printed objects. Defaults to " ".
-        end (str, optional): Character to write at end of output. Defaults to "\\n".
-        file (IO[str], optional): File to write to, or None for stdout. Defaults to None.
-        flush (bool, optional): Has no effect as Rich always flushes output. Defaults to False.
 
+def disable_warnings(category: type[Warning] = exceptions.HTTPWarning) -> None:
     """
-    from .console import Console
+    Helper for quickly disabling all urllib3 warnings.
+    """
+    warnings.simplefilter("ignore", category)
 
-    write_console = get_console() if file is None else Console(file=file)
-    return write_console.print(*objects, sep=sep, end=end)
+
+_DEFAULT_POOL = PoolManager()
 
 
-def print_json(
-    json: Optional[str] = None,
+def request(
+    method: str,
+    url: str,
     *,
-    data: Any = None,
-    indent: Union[None, int, str] = 2,
-    highlight: bool = True,
-    skip_keys: bool = False,
-    ensure_ascii: bool = False,
-    check_circular: bool = True,
-    allow_nan: bool = True,
-    default: Optional[Callable[[Any], Any]] = None,
-    sort_keys: bool = False,
-) -> None:
-    """Pretty prints JSON. Output will be valid JSON.
+    body: _TYPE_BODY | None = None,
+    fields: _TYPE_FIELDS | None = None,
+    headers: typing.Mapping[str, str] | None = None,
+    preload_content: bool | None = True,
+    decode_content: bool | None = True,
+    redirect: bool | None = True,
+    retries: Retry | bool | int | None = None,
+    timeout: Timeout | float | int | None = 3,
+    json: typing.Any | None = None,
+) -> BaseHTTPResponse:
+    """
+    A convenience, top-level request method. It uses a module-global ``PoolManager`` instance.
+    Therefore, its side effects could be shared across dependencies relying on it.
+    To avoid side effects create a new ``PoolManager`` instance and use it instead.
+    The method does not accept low-level ``**urlopen_kw`` keyword arguments.
 
-    Args:
-        json (str): A string containing JSON.
-        data (Any): If json is not supplied, then encode this data.
-        indent (int, optional): Number of spaces to indent. Defaults to 2.
-        highlight (bool, optional): Enable highlighting of output: Defaults to True.
-        skip_keys (bool, optional): Skip keys not of a basic type. Defaults to False.
-        ensure_ascii (bool, optional): Escape all non-ascii characters. Defaults to False.
-        check_circular (bool, optional): Check for circular references. Defaults to True.
-        allow_nan (bool, optional): Allow NaN and Infinity values. Defaults to True.
-        default (Callable, optional): A callable that converts values that can not be encoded
-            in to something that can be JSON encoded. Defaults to None.
-        sort_keys (bool, optional): Sort dictionary keys. Defaults to False.
+    :param method:
+        HTTP request method (such as GET, POST, PUT, etc.)
+
+    :param url:
+        The URL to perform the request on.
+
+    :param body:
+        Data to send in the request body, either :class:`str`, :class:`bytes`,
+        an iterable of :class:`str`/:class:`bytes`, or a file-like object.
+
+    :param fields:
+        Data to encode and send in the request body.
+
+    :param headers:
+        Dictionary of custom headers to send, such as User-Agent,
+        If-None-Match, etc.
+
+    :param bool preload_content:
+        If True, the response's body will be preloaded into memory.
+
+    :param bool decode_content:
+        If True, will attempt to decode the body based on the
+        'content-encoding' header.
+
+    :param redirect:
+        If True, automatically handle redirects (status codes 301, 302,
+        303, 307, 308). Each redirect counts as a retry. Disabling retries
+        will disable redirect, too.
+
+    :param retries:
+        Configure the number of retries to allow before raising a
+        :class:`~urllib3.exceptions.MaxRetryError` exception.
+
+        If ``None`` (default) will retry 3 times, see ``Retry.DEFAULT``. Pass a
+        :class:`~urllib3.util.retry.Retry` object for fine-grained control
+        over different types of retries.
+        Pass an integer number to retry connection errors that many times,
+        but no other types of errors. Pass zero to never retry.
+
+        If ``False``, then retries are disabled and any exception is raised
+        immediately. Also, instead of raising a MaxRetryError on redirects,
+        the redirect response will be returned.
+
+    :type retries: :class:`~urllib3.util.retry.Retry`, False, or an int.
+
+    :param timeout:
+        If specified, overrides the default timeout for this one
+        request. It may be a float (in seconds) or an instance of
+        :class:`urllib3.util.Timeout`.
+
+    :param json:
+        Data to encode and send as JSON with UTF-encoded in the request body.
+        The ``"Content-Type"`` header will be set to ``"application/json"``
+        unless specified otherwise.
     """
 
-    get_console().print_json(
-        json,
-        data=data,
-        indent=indent,
-        highlight=highlight,
-        skip_keys=skip_keys,
-        ensure_ascii=ensure_ascii,
-        check_circular=check_circular,
-        allow_nan=allow_nan,
-        default=default,
-        sort_keys=sort_keys,
+    return _DEFAULT_POOL.request(
+        method,
+        url,
+        body=body,
+        fields=fields,
+        headers=headers,
+        preload_content=preload_content,
+        decode_content=decode_content,
+        redirect=redirect,
+        retries=retries,
+        timeout=timeout,
+        json=json,
     )
 
 
-def inspect(
-    obj: Any,
-    *,
-    console: Optional["Console"] = None,
-    title: Optional[str] = None,
-    help: bool = False,
-    methods: bool = False,
-    docs: bool = True,
-    private: bool = False,
-    dunder: bool = False,
-    sort: bool = True,
-    all: bool = False,
-    value: bool = True,
-) -> None:
-    """Inspect any Python object.
+if sys.platform == "emscripten":
+    from .contrib.emscripten import inject_into_urllib3  # noqa: 401
 
-    * inspect(<OBJECT>) to see summarized info.
-    * inspect(<OBJECT>, methods=True) to see methods.
-    * inspect(<OBJECT>, help=True) to see full (non-abbreviated) help.
-    * inspect(<OBJECT>, private=True) to see private attributes (single underscore).
-    * inspect(<OBJECT>, dunder=True) to see attributes beginning with double underscore.
-    * inspect(<OBJECT>, all=True) to see all attributes.
-
-    Args:
-        obj (Any): An object to inspect.
-        title (str, optional): Title to display over inspect result, or None use type. Defaults to None.
-        help (bool, optional): Show full help text rather than just first paragraph. Defaults to False.
-        methods (bool, optional): Enable inspection of callables. Defaults to False.
-        docs (bool, optional): Also render doc strings. Defaults to True.
-        private (bool, optional): Show private attributes (beginning with underscore). Defaults to False.
-        dunder (bool, optional): Show attributes starting with double underscore. Defaults to False.
-        sort (bool, optional): Sort attributes alphabetically. Defaults to True.
-        all (bool, optional): Show all attributes. Defaults to False.
-        value (bool, optional): Pretty print value. Defaults to True.
-    """
-    _console = console or get_console()
-    from pip._vendor.rich._inspect import Inspect
-
-    # Special case for inspect(inspect)
-    is_inspect = obj is inspect
-
-    _inspect = Inspect(
-        obj,
-        title=title,
-        help=is_inspect or help,
-        methods=is_inspect or methods,
-        docs=is_inspect or docs,
-        private=private,
-        dunder=dunder,
-        sort=sort,
-        all=all,
-        value=value,
-    )
-    _console.print(_inspect)
-
-
-if __name__ == "__main__":  # pragma: no cover
-    print("Hello, **World**")
+    inject_into_urllib3()
